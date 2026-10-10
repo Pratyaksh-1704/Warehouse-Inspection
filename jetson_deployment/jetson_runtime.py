@@ -1,4 +1,4 @@
-"""Small Python 3.6-compatible runtime helpers for the Jetson Nano scripts."""
+"""Shared QR, camera, ONNX inference, and store-and-forward helpers."""
 
 import json
 import os
@@ -12,17 +12,6 @@ import cv2
 import numpy as np
 
 
-try:
-    import zxingcpp
-except Exception:
-    zxingcpp = None
-
-try:
-    from pyzbar import pyzbar
-except Exception:
-    pyzbar = None
-
-
 def _as_float(value, default=0.0):
     try:
         return float(value)
@@ -30,8 +19,8 @@ def _as_float(value, default=0.0):
         return default
 
 
-def parse_barcode_payload(payload):
-    """Parse the same JSON and ITEM|TYPE|COST|SHELF payloads as barcode_model.py."""
+def parse_qr_payload(payload):
+    """Parse the existing warehouse QR JSON or ITEM|TYPE|COST|SHELF payload."""
     text = (payload or "").strip()
     if text.startswith("{") and text.endswith("}"):
         try:
@@ -72,7 +61,7 @@ def parse_barcode_payload(payload):
     }
 
 
-def barcode_event(detection, mission_id):
+def qr_event(detection, mission_id):
     data = detection["data"]
     return {
         "timestamp": time.time(),
@@ -85,12 +74,15 @@ def barcode_event(detection, mission_id):
         "product_type": data["product_type"],
         "cost": data["cost"],
         "currency": "INR (Rs.)",
-        "barcode_type": detection["barcode_type"],
+        "qr_code_type": "QR_CODE",
+        "raw_qr_payload": detection["raw_payload"],
+        # Preserve the existing server/database fields for payload compatibility.
+        "barcode_type": "QR_CODE",
         "raw_barcode": detection["raw_payload"],
     }
 
 
-def _make_barcode_detection(payload, barcode_type, polygon, frame):
+def _make_qr_detection(payload, polygon, frame):
     height, width = frame.shape[:2]
     points = [(int(point[0]), int(point[1])) for point in polygon]
     if points:
@@ -104,95 +96,64 @@ def _make_barcode_detection(payload, barcode_type, polygon, frame):
         x1, y1, x2, y2 = 0, 0, width - 1, height - 1
     return {
         "raw_payload": payload,
-        "barcode_type": barcode_type,
-        "data": parse_barcode_payload(payload),
+        "qr_code_type": "QR_CODE",
+        "data": parse_qr_payload(payload),
         "polygon": points,
         "bbox": [x1, y1, x2, y2],
     }
 
 
-def decode_barcodes(frame, engine="auto"):
-    """Decode QR and 1D/2D barcodes, preferring the project's fast reader engines."""
+def qr_visible(frame):
+    """Return true when OpenCV sees a QR quadrilateral, even before decoding it."""
+    if frame is None or frame.size == 0:
+        return False
+    detector = cv2.QRCodeDetector()
+    try:
+        found, points = detector.detectMulti(frame)
+        if found and points is not None:
+            return True
+    except Exception:
+        pass
+    try:
+        found, points = detector.detect(frame)
+        return bool(found and points is not None)
+    except Exception:
+        return False
+
+
+def decode_qr_codes(frame):
+    """Decode QR payloads using OpenCV only."""
     if frame is None or frame.size == 0:
         return []
-
-    if engine in ("auto", "zxing") and zxingcpp is not None:
-        try:
+    detector = cv2.QRCodeDetector()
+    try:
+        ok, texts, points, _ = detector.detectAndDecodeMulti(frame)
+        if ok and texts is not None and points is not None:
             found = []
-            for item in zxingcpp.read_barcodes(frame):
-                payload = (item.text or "").strip()
-                if not payload:
-                    continue
-                polygon = []
-                position = getattr(item, "position", None)
-                if position is not None:
-                    polygon = [
-                        (position.top_left.x, position.top_left.y),
-                        (position.top_right.x, position.top_right.y),
-                        (position.bottom_right.x, position.bottom_right.y),
-                        (position.bottom_left.x, position.bottom_left.y),
-                    ]
-                found.append(_make_barcode_detection(payload, str(item.format), polygon, frame))
+            for text, point_array in zip(texts, points):
+                text = (text or "").strip()
+                if text:
+                    polygon = [(point[0], point[1]) for point in point_array]
+                    found.append(_make_qr_detection(text, polygon, frame))
             if found:
                 return found
-        except Exception as exc:
-            if engine == "zxing":
-                print("[barcode] zxing-cpp failed: {}".format(exc))
-
-    if engine in ("auto", "pyzbar") and pyzbar is not None:
-        try:
-            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-            found = []
-            for item in pyzbar.decode(gray):
-                payload = item.data.decode("utf-8", errors="ignore").strip()
-                if not payload:
-                    continue
-                polygon = [(point.x, point.y) for point in item.polygon] if item.polygon else []
-                if not polygon and item.rect:
-                    rect = item.rect
-                    polygon = [
-                        (rect.left, rect.top),
-                        (rect.left + rect.width, rect.top),
-                        (rect.left + rect.width, rect.top + rect.height),
-                        (rect.left, rect.top + rect.height),
-                    ]
-                found.append(_make_barcode_detection(payload, item.type, polygon, frame))
-            if found:
-                return found
-        except Exception as exc:
-            if engine == "pyzbar":
-                print("[barcode] pyzbar failed: {}".format(exc))
-
-    if engine in ("auto", "opencv"):
-        detector = cv2.QRCodeDetector()
-        try:
-            ok, texts, points, _ = detector.detectAndDecodeMulti(frame)
-            if ok and texts is not None and points is not None:
-                found = []
-                for text, point_array in zip(texts, points):
-                    text = text.strip()
-                    if text:
-                        polygon = [(point[0], point[1]) for point in point_array]
-                        found.append(_make_barcode_detection(text, "QR_CODE", polygon, frame))
-                if found:
-                    return found
-        except Exception:
-            pass
-        try:
-            text, points, _ = detector.detectAndDecode(frame)
-            if text:
-                polygon = [(point[0], point[1]) for point in points.reshape(-1, 2)] if points is not None else []
-                return [_make_barcode_detection(text, "QR_CODE", polygon, frame)]
-        except Exception:
-            pass
+    except Exception:
+        pass
+    try:
+        text, points, _ = detector.detectAndDecode(frame)
+        if text:
+            polygon = [(point[0], point[1]) for point in points.reshape(-1, 2)] if points is not None else []
+            return [_make_qr_detection(text, polygon, frame)]
+    except Exception:
+        pass
     return []
 
 
-def draw_barcode_overlay(frame, detections, fps=None):
+def draw_qr_overlay(frame, detections, fps=None, status="SCANNING"):
     canvas = frame.copy()
     height, width = canvas.shape[:2]
     cv2.rectangle(canvas, (0, 0), (width, 42), (24, 30, 38), -1)
-    title = "WAREHOUSE BARCODE SCANNER | {} code(s)".format(len(detections))
+    title = "WAREHOUSE QR INSPECTION | {} QR code(s) | {}".format(len(detections), status)
     if fps is not None:
         title += " | {:.1f} FPS".format(fps)
     cv2.putText(canvas, title, (12, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.62, (0, 255, 205), 2, cv2.LINE_AA)

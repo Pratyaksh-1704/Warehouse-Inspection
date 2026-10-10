@@ -1,2 +1,2 @@
-# Install OpenCV, NumPy, and libzbar0 from apt on JetPack. See install_jetson_deps.sh.
-pyzbar==0.1.9
+# OpenCV and NumPy are provided by the Jetson OS / ROS installation.
+# The QR-only ROS node has no pip-only runtime dependencies.

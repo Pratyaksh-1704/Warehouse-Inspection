@@ -2,4 +2,10 @@ __pycache__/
 *.py[cod]
 .ultralytics/
 nano_inspections.sqlite3*
+inspection_outbox.sqlite3*
 inspection_events.jsonl
+build/
+install/
+log/
+*.sqlite3-wal
+*.sqlite3-shm

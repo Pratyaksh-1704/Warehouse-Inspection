@@ -1,0 +1,23 @@
+{
+  "input_size": 640,
+  "class_names": [
+    "cinthol_pack_of_4_perfect",
+    "diet_coca_cola_perfect",
+    "kurkure_perfect",
+    "lays_perfect",
+    "superyou_protein_coffee_flacoured_perfect",
+    "yogabar_protein_wafer_perfect",
+    "diet_coca_cola_damaged",
+    "kurkure_damaged",
+    "lays_damaged",
+    "mountain_dew_damaged",
+    "pintola_protein_oats_damaged"
+  ],
+  "qr_item_aliases": {
+    "cinthol soap pack of 4": "cinthol pack of 4",
+    "lays classic salted 50g": "lays",
+    "lays india magic masala 50g": "lays",
+    "superyou coffee protein 1kg": "superyou protein coffee flacoured",
+    "protein oats": "pintola protein oats"
+  }
+}

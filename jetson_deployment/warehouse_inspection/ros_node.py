@@ -68,7 +68,7 @@ class QrStopAndInspectNode(Node):
 
         self.declare_parameter("image_topic", "/camera/image_raw")
         self.declare_parameter("nav_cmd_topic", "/cmd_vel_nav")
-        self.declare_parameter("motor_cmd_topic", "/cmd_vel")
+        self.declare_parameter("motor_cmd_topic", "/cmd_vel_inspected")
         self.declare_parameter("status_topic", "/inspection/status")
         self.declare_parameter("product_model", _source_or_installed_path("models/product_types.onnx"))
         self.declare_parameter("damage_model", _source_or_installed_path("models/best.onnx"))
@@ -85,6 +85,8 @@ class QrStopAndInspectNode(Node):
         self.declare_parameter("qr_clear_frames", 5)
         self.declare_parameter("cmd_vel_rate", 20.0)
         self.declare_parameter("cmd_vel_timeout", 0.5)
+        self.declare_parameter("camera_startup_timeout_sec", 15.0)
+        self.declare_parameter("camera_timeout_sec", 1.0)
 
         self.image_topic = str(self.get_parameter("image_topic").value)
         self.nav_cmd_topic = str(self.get_parameter("nav_cmd_topic").value)
@@ -96,6 +98,12 @@ class QrStopAndInspectNode(Node):
         self.qr_settle_seconds = float(self.get_parameter("qr_settle_seconds").value)
         self.qr_clear_frames = max(1, int(self.get_parameter("qr_clear_frames").value))
         self.cmd_vel_timeout = float(self.get_parameter("cmd_vel_timeout").value)
+        self.camera_startup_timeout_sec = float(
+            self.get_parameter("camera_startup_timeout_sec").value
+        )
+        self.camera_timeout_sec = float(self.get_parameter("camera_timeout_sec").value)
+        if self.camera_startup_timeout_sec <= 0.0 or self.camera_timeout_sec <= 0.0:
+            raise ValueError("Camera watchdog timeouts must be greater than zero")
 
         with open(str(self.get_parameter("product_classes").value), "r", encoding="utf-8") as stream:
             class_config = json.load(stream)
@@ -140,6 +148,9 @@ class QrStopAndInspectNode(Node):
         self._inspection_active = False
         self._processing = False
         self._inspection_error = False
+        self._camera_fault = False
+        self._node_started_at = time.monotonic()
+        self._last_image_time = None
         self._active_since = 0.0
         self._pending_qr = None
         self._latched_payload = None
@@ -175,11 +186,33 @@ class QrStopAndInspectNode(Node):
             self._last_nav_cmd_time = time.monotonic()
 
     def _publish_gated_command(self):
+        now = time.monotonic()
+        camera_timed_out = False
         with self._lock:
-            stopped = self._inspection_active or self._inspection_error
+            if not self._camera_fault:
+                if self._last_image_time is None:
+                    camera_timed_out = (
+                        now - self._node_started_at > self.camera_startup_timeout_sec
+                    )
+                else:
+                    camera_timed_out = now - self._last_image_time > self.camera_timeout_sec
+                if camera_timed_out:
+                    # Latch the stop. A camera that comes back must not restart motion
+                    # without an operator restarting the inspection node.
+                    self._camera_fault = True
+            stopped = (
+                self._inspection_active or self._inspection_error or self._camera_fault
+                or self._last_image_time is None
+            )
             command = copy.deepcopy(self._last_nav_cmd)
             command_time = self._last_nav_cmd_time
-        if stopped or command is None or time.monotonic() - command_time > self.cmd_vel_timeout:
+        if camera_timed_out:
+            self.get_logger().error(
+                "Inspection camera timed out; rover output is latched to zero. "
+                "Restore the camera and restart this node before resuming."
+            )
+            self._publish_status("CAMERA_TIMEOUT_STOPPED")
+        if stopped or command is None or now - command_time > self.cmd_vel_timeout:
             self._motor_pub.publish(_zero_twist())
         else:
             self._motor_pub.publish(command)
@@ -200,6 +233,12 @@ class QrStopAndInspectNode(Node):
         except Exception as exc:
             self.get_logger().warning("Could not convert camera image: %s" % exc)
             return
+
+        with self._lock:
+            self._last_image_time = time.monotonic()
+            # Keep publishing zero after a camera fault, even if frames return.
+            if self._camera_fault:
+                return
 
         visible = qr_visible(frame)
         qr_detections = decode_qr_codes(frame) if visible else []
@@ -346,12 +385,13 @@ class QrStopAndInspectNode(Node):
             condition_detections, key=lambda detection: detection["confidence"]
         ) if condition_detections else None
         condition_label = condition_detection["label"] if condition_detection else ""
-        if "damaged" in condition_label.lower():
-            is_damaged = True
-            condition_status = "DAMAGED"
-        elif "undamaged" in condition_label.lower():
+        normalized_condition_label = condition_label.lower()
+        if "undamaged" in normalized_condition_label:
             is_damaged = False
             condition_status = "UNDAMAGED"
+        elif "damaged" in normalized_condition_label:
+            is_damaged = True
+            condition_status = "DAMAGED"
         else:
             is_damaged = False
             condition_status = "UNKNOWN"

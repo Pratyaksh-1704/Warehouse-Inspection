@@ -8,11 +8,15 @@ def generate_launch_description():
     image_topic = LaunchConfiguration("image_topic")
     nav_cmd_topic = LaunchConfiguration("nav_cmd_topic")
     motor_cmd_topic = LaunchConfiguration("motor_cmd_topic")
+    camera_startup_timeout_sec = LaunchConfiguration("camera_startup_timeout_sec")
+    camera_timeout_sec = LaunchConfiguration("camera_timeout_sec")
 
     return LaunchDescription([
         DeclareLaunchArgument("image_topic", default_value="/camera/image_raw"),
         DeclareLaunchArgument("nav_cmd_topic", default_value="/cmd_vel_nav"),
-        DeclareLaunchArgument("motor_cmd_topic", default_value="/cmd_vel"),
+        DeclareLaunchArgument("motor_cmd_topic", default_value="/cmd_vel_inspected"),
+        DeclareLaunchArgument("camera_startup_timeout_sec", default_value="15.0"),
+        DeclareLaunchArgument("camera_timeout_sec", default_value="1.0"),
         Node(
             package="warehouse_inspection",
             executable="qr_inspector",
@@ -22,6 +26,8 @@ def generate_launch_description():
                 "image_topic": image_topic,
                 "nav_cmd_topic": nav_cmd_topic,
                 "motor_cmd_topic": motor_cmd_topic,
+                "camera_startup_timeout_sec": camera_startup_timeout_sec,
+                "camera_timeout_sec": camera_timeout_sec,
             }],
         ),
     ])

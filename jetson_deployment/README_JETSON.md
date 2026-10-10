@@ -27,24 +27,27 @@ Defaults:
 
 The command path must pass through the inspection node: navigation publishes to the node's input topic; this node is the only publisher to the gated output; the ESP32 bridge consumes only /cmd_vel_inspected. Do not let the ESP32 also consume the ungated navigation topic, or the rover could move while this node is publishing zero. The node forwards fresh navigation velocity while healthy and continuously publishes zero during inspection, on stale navigation commands, and on a camera timeout. Change launch arguments to match the topics in your Nav2 setup.
 
-This repository currently has no ESP32 firmware, serial packet format, motor-driver configuration, or micro-ROS client. The ROS node therefore provides the Jetson-side gate, but the ESP32 needs a matching bridge before it can actuate motors. The ESP32 should also have its own command-heartbeat timeout that stops the motors if it stops receiving commands from the Jetson. The actual stop behavior (coast or active brake) depends on the ESP32 firmware and motor driver.
+`esp32_serial_bridge` is the Jetson-side USB serial transport. `rover_inspection.launch.py` starts it with the QR inspection node. The bridge reads only `/cmd_vel_inspected` and sends versioned ASCII frames at 20 Hz using `CMD1,<sequence>,<linear_mm_per_s>,<angular_mrad_per_s>\n` at 115200 baud by default. It sends zero velocity if that ROS command stream goes stale. The ESP32 firmware must parse this same frame and must independently stop the L298N if serial frames stop arriving. This repository does not contain the ESP32 firmware or your board's GPIO pin map yet, so the serial transport is not a complete motor controller until that matching firmware is flashed.
+
+For a four-wheel skid-steer rover with one L298N, the intended wiring is the two left motors on one bridge channel and the two right motors on the other. Confirm the motors are already grouped that way and that their combined current is within the driver's limits. The ESP32 should keep the ultrasonic obstacle stop local: a close obstacle overrides any nonzero Jetson command. Put the ultrasonic sensor facing forward while the rover is driving; the ESP32 should control the servo if it sweeps the sensor. An obstacle stop should not depend on ROS or the Jetson.
 
 The node expects an existing ROS camera publisher. It does not open a local camera device itself. Camera A can remain assigned to the navigation stack's visual odometry or other navigation sensor node; Camera B must publish to image_topic for inspection. The navigation camera is not consumed directly by this inspection node.
 
 ## What ROS does in this system
 
-ROS 2 Humble is the communication and process framework on the Jetson. The installed ROS distribution lives under /opt/ros/humble; this project is built in your workspace (for example ~/ros2_ws/src/warehouse_inspection) and installed under ~/ros2_ws/install. `ros2 launch warehouse_inspection qr_inspection.launch.py` starts the `qr_inspector` node implemented in `warehouse_inspection/ros_node.py`.
+ROS 2 Humble is the communication and process framework on the Jetson. The installed ROS distribution lives under /opt/ros/humble; this project is built in your workspace (for example ~/ros2_ws/src/warehouse_inspection) and installed under ~/ros2_ws/install. `ros2 launch warehouse_inspection rover_inspection.launch.py` starts `qr_inspector` from `warehouse_inspection/ros_node.py` and `esp32_serial_bridge` from `warehouse_inspection/serial_bridge.py`.
 
 ROS is used here to:
 
 - receive Camera B frames as `sensor_msgs/Image`;
 - receive navigation velocity as `geometry_msgs/Twist` and publish a gated Twist stream for the motor bridge;
+- transfer that gated velocity over USB serial to the ESP32;
 - publish inspection and fault states on `/inspection/status`;
 - run the camera subscriber, inspection callbacks, and periodic stop/forward command timer.
 
 ROS does not perform the product categorization or damage classification. Those run inside the Jetson node: `jetson_runtime.py` decodes the QR payload and loads/runs the trained ONNX product-identity and damage models through OpenCV DNN. The node compares the expected item from the QR JSON with the model's observed product class, labels a different supported product as `WRONG_OBJECT`, checks damaged/undamaged condition, then writes the inspection event to SQLite/JSONL. The QR uses the existing JSON field format; `barcode_type` and `raw_barcode` remain only as legacy server field names, populated with `QR_CODE` and the QR text.
 
-SLAM and map creation are separate from this package. A separate ROS SLAM/Nav2 setup creates or loads the map and generates navigation velocity. This package does not launch SLAM, create a map, or select navigation goals; it only inspects the second camera and gates the velocity stream before it reaches the ESP32.
+SLAM and map creation are separate from this package. After mapping, localization and Nav2 must load the saved map and generate navigation velocity from goals. Camera A is used by the navigation stack only if that stack is configured to use it; merely having the mapped camera does not make the rover follow the map. This package does not create maps, localize the rover, or select goals. It inspects Camera B, gates Nav2 velocity, and forwards the result to the ESP32. The ESP32's ultrasonic obstacle stop overrides that command locally.
 
 ## QR payload compatibility
 
@@ -85,6 +88,8 @@ colcon build --symlink-install
 source install/setup.bash
 ~~~
 
+`rosdep` installs the Python serial dependency. After connecting the ESP32 to a Jetson USB port, identify the device with `ls /dev/ttyUSB* /dev/ttyACM*` and pass the resulting path as `serial_port` when launching.
+
 The included dependency script installs system OpenCV and NumPy only:
 
 ~~~bash
@@ -104,24 +109,28 @@ export WAREHOUSE_SERVER_URL=http://<LAPTOP_IP>:8080
 export WAREHOUSE_SERVER_TOKEN=<same-token-as-server>
 source /opt/ros/humble/setup.bash
 source ~/ros2_ws/install/setup.bash
-ros2 launch warehouse_inspection qr_inspection.launch.py
+ros2 launch warehouse_inspection rover_inspection.launch.py \
+  image_topic:=/camera/inspection/image_raw \
+  nav_cmd_topic:=/cmd_vel_nav \
+  motor_cmd_topic:=/cmd_vel_inspected \
+  serial_port:=/dev/ttyUSB0
 ~~~
 
 Override topic names when needed:
 
 ~~~bash
-ros2 launch warehouse_inspection qr_inspection.launch.py \
+ros2 launch warehouse_inspection rover_inspection.launch.py \
   image_topic:=/camera/color/image_raw \
   nav_cmd_topic:=/cmd_vel_nav \
   motor_cmd_topic:=/cmd_vel_inspected
 ~~~
 
-For two cameras, replace `/camera/color/image_raw` with the ROS image topic published by the inspection camera. Confirm topic names first with `ros2 topic list` and `ros2 topic info /camera/inspection/image_raw` (use your actual topic). Keep Nav2's command output on `nav_cmd_topic`, and configure the ESP32 bridge to listen only to `motor_cmd_topic`.
+For two cameras, use Camera B's ROS image topic as `image_topic`. Confirm topic names first with `ros2 topic list` and `ros2 topic info /camera/inspection/image_raw` (replace with your actual topic). Keep Nav2's command output on `nav_cmd_topic`; the serial bridge consumes only `motor_cmd_topic`.
 
 The watchdog's default limits can be overridden at launch:
 
 ~~~bash
-ros2 launch warehouse_inspection qr_inspection.launch.py \
+ros2 launch warehouse_inspection rover_inspection.launch.py \
   image_topic:=/camera/inspection/image_raw \
   nav_cmd_topic:=/cmd_vel_nav \
   motor_cmd_topic:=/cmd_vel_inspected \
@@ -133,6 +142,7 @@ Inspect status and logs:
 
 ~~~bash
 ros2 topic echo /inspection/status
+ros2 topic echo /rover/esp32_link_status
 tail -f ~/.local/state/warehouse_inspection/inspection_events.jsonl
 ~~~
 
@@ -140,6 +150,6 @@ The SQLite upload outbox is stored at ~/.local/state/warehouse_inspection/inspec
 
 ## Hardware stop test
 
-The physical rover has not been tested by this repository. Before the first powered run, raise the drive wheels or restrain the rover, keep a reachable hardware emergency stop, and verify that the motor bridge consumes only `/cmd_vel_inspected`. With the wheels restrained, verify that a nonzero Nav2 command reaches the bridge while the inspection camera is fresh; a QR detection outputs zero; unplugging or disabling Camera B results in `CAMERA_TIMEOUT_STOPPED` and zero output after the configured timeout; restoring the camera does not resume motion until the node is deliberately restarted; and the ESP32 heartbeat timeout stops the motors if Jetson commands cease. Confirm actual motor stop/braking behavior with the emergency stop ready before floor testing.
+The physical rover has not been tested by this repository. Before the first powered run, raise the drive wheels or restrain the rover and keep a reachable hardware emergency stop. Verify the L298N is driven only by ESP32 firmware, and that firmware receives only the Jetson's gated serial frames. Check that a fresh camera plus nonzero Nav2 command reaches the ESP32, a QR or camera timeout sends zero velocity, an obstacle makes the ESP32 stop locally, and loss of serial frames triggers the ESP32 watchdog. Restoring the camera or serial link must not restart movement without fresh navigation commands. Confirm stop behavior with the emergency stop ready before floor testing.
 
-On the Orin Nano, verify the exact installed OS and architecture (`lsb_release -a`, `uname -m`, and `echo $ROS_DISTRO`) before building. Since Humble is already installed on your board, keep sourcing `/opt/ros/humble/setup.bash` and use the existing JetPack/OpenCV/cv_bridge packages rather than replacing them with an incompatible Python/OpenCV installation.
+You said this board is a Jetson Nano. The original Nano's official Jetson Linux R32.7.5 image is based on Ubuntu 18.04; JetPack 6 and Ubuntu 22.04 target Orin devices. ROS 2 Humble's standard Ubuntu target is Jammy 22.04, so the stock original Nano image is not a supported Humble platform. [NVIDIA Nano release](https://developer.nvidia.com/embedded/linux-tegra-r3275), [NVIDIA JetPack 6](https://developer.nvidia.com/embedded/jetpack-sdk-621), [ROS 2 Humble supported platforms](https://docs.ros.org/en/humble/Releases/Release-Humble-Hawksbill.html#supported-platforms). Before building, check `lsb_release -a`, `uname -m`, `echo $ROS_DISTRO`, and `head -n 1 /etc/nv_tegra_release`; if Humble is installed through a custom image/container, verify this package and camera drivers there.

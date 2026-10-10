@@ -28,6 +28,7 @@ setup(
     entry_points={
         "console_scripts": [
             "qr_inspector = warehouse_inspection.ros_node:main",
+            "esp32_serial_bridge = warehouse_inspection.serial_bridge:main",
         ],
     },
 )
